@@ -6,10 +6,13 @@
 
 - 支持 decoder-only Transformer 模型（LLaMA/Qwen 风格）
 - KV Cache 优化，支持 Prefill + Decode 两阶段推理
+- Paged KV Cache，支持动态内存分配
 - 支持 GQA（Grouped Query Attention）
-- 批量推理与请求调度
-- 支持从 ModelScope 加载预训练模型
+- 批量推理与请求调度（Continuous Batching）
+- 支持从 HuggingFace 加载预训练模型（Qwen2等）
+- RoPE 旋转位置编码
 - 灵活的配置系统
+- 轻量级性能分析工具
 
 ## 项目结构
 
@@ -23,18 +26,18 @@ model_inference/
 │   │
 │   ├── engine/                   # 推理引擎
 │   │   ├── engine.py             # LLMEngine 主类
-│   │   ├── kv_cache.py           # KV Cache 实现
-│   │   ├── paged_kv_cache.py     # 分页 KV Cache
+│   │   ├── kv_cache.py           # Dense KV Cache
+│   │   ├── paged_kv_cache.py     # Paged KV Cache
+│   │   ├── block_manager.py      # KV Block 内存池管理
 │   │   ├── scheduler.py          # 请求调度器
-│   │   ├── request.py            # 请求管理
+│   │   ├── request.py            # 请求生命周期管理
 │   │   ├── generation.py         # 生成函数
-│   │   ├── block_manager.py      # 内存块管理
-│   │   └── profiler.py           # 性能分析
+│   │   └── profiler.py           # 性能分析工具
 │   │
 │   └── models/                   # 模型实现
 │       ├── transformer.py        # DecoderOnlyModel
 │       ├── attention.py          # 注意力机制 (支持 MHA/GQA)
-│       ├── layers.py             # 网络层 (RMSNorm, MLP 等)
+│       ├── layers.py             # 网络层 (RMSNorm, SwiGLU MLP)
 │       ├── rope.py               # RoPE 位置编码
 │       └── weight_loader.py      # 预训练权重加载
 │
@@ -48,12 +51,13 @@ model_inference/
 │   ├── multi_generate.py         # 批量推理示例
 │   └── real_model_inference.py   # 真实模型推理示例
 │
-├── tests/                        # 测试用例
-│   ├── test_kv_cache.py
-│   ├── test_paged_kv.py
-│   ├── test_engine_scheduler.py
-│   └── test_tiny_model.py
+├── tests/                        # 测试用例 (64个测试)
+│   ├── test_kv_cache.py          # KV Cache 测试
+│   ├── test_paged_kv.py          # Paged KV Cache 测试
+│   ├── test_engine_scheduler.py  # Engine/Scheduler 测试
+│   └── test_tiny_model.py        # 模型组件测试
 │
+├── stage_*.txt                   # 阶段设计文档
 └── pyproject.toml                # 项目配置
 ```
 
@@ -72,6 +76,9 @@ source venv/bin/activate  # Linux/Mac
 # 安装依赖
 pip install -e .
 
+# 安装真实模型推理所需依赖
+pip install transformers safetensors sentencepiece accelerate
+
 # 安装开发依赖（可选）
 pip install -e ".[dev]"
 ```
@@ -89,6 +96,7 @@ model_config = ModelConfig(
     hidden_dim=256,
     num_layers=4,
     num_heads=4,
+    num_kv_heads=4,  # GQA: 可以小于 num_heads
 )
 
 engine_config = EngineConfig(
@@ -138,7 +146,7 @@ output = generate(
 print(f"Generated: {output.tolist()}")
 ```
 
-### 3. 加载真实模型推理
+### 3. 加载真实模型推理（推荐）
 
 ```python
 import torch
@@ -146,16 +154,16 @@ from my_llm_engine import GenerationConfig, EngineConfig
 from my_llm_engine.models.weight_loader import load_model_from_modelscope
 from my_llm_engine.engine import generate
 
-# 配置
+# 配置 (GPU推理)
 engine_config = EngineConfig(
     device="cuda",
     dtype="float16",
     max_seq_len=512,
 )
 
-# 从 ModelScope 加载模型
+# 加载预训练模型 (自动从 HuggingFace 镜像下载)
 model, tokenizer, model_config, engine_config = load_model_from_modelscope(
-    model_id="Qwen/Qwen2-0.5B",
+    model_id="Qwen/Qwen2-0.5B",  # 支持 Qwen2-0.5B, Qwen2-1.5B, Qwen2-7B 等
     engine_config=engine_config,
 )
 
@@ -182,6 +190,7 @@ with torch.no_grad():
 
 output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
 print(output_text)
+# 输出示例: Hello, my name is Sarah and I am a 20 year old student...
 ```
 
 ### 4. 使用 LLMEngine 进行批量推理
@@ -220,14 +229,16 @@ for req_id, request in engine.get_all_responses().items():
 
 ### ModelConfig
 
-模型架构配置，包含：
+模型架构配置：
 - `vocab_size`: 词表大小
 - `hidden_dim`: 隐藏层维度
 - `num_layers`: Transformer 层数
 - `num_heads`: 注意力头数
-- `num_kv_heads`: KV 头数（用于 GQA）
+- `num_kv_heads`: KV 头数（用于 GQA，可小于 num_heads）
 - `intermediate_dim`: FFN 中间层维度
 - `max_position_embeddings`: 最大位置编码长度
+- `rope_theta`: RoPE 基频（Qwen2 使用 1000000）
+- `attention_bias`: 是否使用 attention bias（Qwen2 为 True）
 
 ### EngineConfig
 
@@ -237,25 +248,24 @@ for req_id, request in engine.get_all_responses().items():
 - `max_seq_len`: 最大序列长度
 - `max_batch_size`: 最大批次大小
 
-### GenerationConfig
-
-生成参数配置：
-- `max_new_tokens`: 最大生成 token 数
-- `temperature`: 采样温度
-- `top_k`: Top-K 采样
-- `top_p`: Top-P (nucleus) 采样
-- `do_sample`: 是否启用采样
-
 ### KVCache
 
 KV 缓存用于优化自回归生成：
-- Prefill 阶段：处理完整 prompt，填充 KV Cache
-- Decode 阶段：每次只处理一个新 token，复用缓存
+- **Prefill 阶段**：处理完整 prompt，填充 KV Cache
+- **Decode 阶段**：每次只处理一个新 token，复用缓存
+- **Paged KV Cache**：按 block 动态分配，支持更长序列
+
+## 性能
+
+在 NVIDIA A30 (24GB) 上测试 Qwen2-0.5B：
+- 模型加载：约 10 秒
+- 推理速度：约 25 tokens/s (float16)
+- 显存占用：约 2GB
 
 ## 运行测试
 
 ```bash
-# 运行所有测试
+# 运行所有测试 (64个测试)
 pytest tests/ -v
 
 # 运行特定测试
@@ -274,22 +284,32 @@ python examples/basic_generate.py
 # KV Cache 推理测试
 python examples/tiny_generate.py
 
-# 真实模型推理（需要下载模型）
+# 真实模型推理（需要 GPU 和下载模型）
 python examples/real_model_inference.py
 ```
 
 ## 支持的模型
 
 当前支持加载以下模型架构：
-- Qwen2 系列（Qwen2-0.5B, Qwen2-1.5B, Qwen2-7B 等）
-- 其他 LLaMA 风格的 decoder-only 模型
+- **Qwen2 系列**：Qwen2-0.5B, Qwen2-1.5B, Qwen2-7B 等（已验证）
+- 其他 LLaMA 风格的 decoder-only 模型（理论支持）
+
+## 开发阶段
+
+项目分阶段开发，详见 `stage_*.txt` 文档：
+- Stage 0: 项目骨架与配置系统
+- Stage 1: MVP 前向推理
+- Stage 2: KV Cache 优化
+- Stage 3: Engine + Scheduler 多请求调度
+- Stage 4: Paged KV Cache + 性能分析
 
 ## 依赖
 
 - Python >= 3.8
 - PyTorch >= 2.0.0
-- transformers（用于加载预训练模型）
-- modelscope（用于从 ModelScope 下载模型）
+- transformers >= 4.40.0（用于加载预训练模型）
+- safetensors（用于加载 safetensors 格式权重）
+- sentencepiece（用于 tokenizer）
 
 ## License
 
