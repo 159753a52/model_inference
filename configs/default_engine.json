@@ -1,0 +1,13 @@
+{
+  "device": "cpu",
+  "dtype": "float32",
+  "max_seq_len": 2048,
+  "max_batch_size": 4,
+  "default_max_new_tokens": 256,
+  "default_temperature": 1.0,
+  "default_top_p": 1.0,
+  "default_top_k": 50,
+  "max_memory_gb": 16.0,
+  "use_kv_cache": true,
+  "log_level": "INFO"
+}

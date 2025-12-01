@@ -1,0 +1,288 @@
+================================================================================
+                    阶段 1：MVP 前向推理
+================================================================================
+
+第 1 部分：阶段 1 目标总览
+--------------------------------------------------------------------------------
+
+最小能力：
+给定 input_ids，通过 DecoderOnlyModel 得到 logits，并通过 generate() 完成
+自回归文本生成。
+
+有意不做：
+- 不实现 KV Cache（每步重算整个序列）
+- 不做复杂调度和批量管理
+- 不做跨设备并行和量化
+
+预留扩展点：
+- SelfAttention.forward 预留 kv_cache 参数
+- GQA 支持（num_kv_heads 可与 num_heads 不同）
+- GenerationConfig 支持多种采样策略
+
+完成标准：
+1. 能导入 from my_llm_engine.models import DecoderOnlyModel ✓
+2. 前向传播输出shape正确 [B, S, vocab_size] ✓
+3. generate() 能生成指定数量的tokens ✓
+4. GQA 配置能正常工作 ✓
+5. 所有12个单元测试通过 ✓
+
+
+第 2 部分：模块与文件结构设计
+--------------------------------------------------------------------------------
+
+my_llm_engine/
+├── models/
+│   ├── __init__.py           # 导出所有模型组件
+│   ├── layers.py             # RMSNorm, MLP (SwiGLU)
+│   ├── rope.py               # RotaryEmbedding (旋转位置编码)
+│   ├── attention.py          # SelfAttention (支持GQA)
+│   └── transformer.py        # DecoderLayer, DecoderOnlyModel
+├── engine/
+│   ├── __init__.py           # 导出生成接口
+│   └── generation.py         # generate(), 采样函数
+examples/
+└── tiny_generate.py          # 完整推理流程验证
+tests/
+└── test_tiny_model.py        # 12个单元测试
+
+文件职责说明：
+
+| 文件            | 职责                                                      |
+|-----------------|-----------------------------------------------------------|
+| layers.py       | RMSNorm归一化 + MLP(SwiGLU激活)                           |
+| rope.py         | 旋转位置编码，预计算频率表，支持动态序列长度              |
+| attention.py    | 多头自注意力，支持GQA，预留KV Cache接口                   |
+| transformer.py  | DecoderLayer组合attn+mlp，DecoderOnlyModel完整模型        |
+| generation.py   | generate()自回归生成，top-k/top-p采样                     |
+
+
+第 3 部分：关键模块接口设计
+--------------------------------------------------------------------------------
+
+3.1 layers.py: RMSNorm & MLP
+----------------------------
+
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization"""
+    
+    def __init__(self, hidden_dim: int, eps: float = 1e-5):
+        # 公式: x * weight / sqrt(mean(x^2) + eps)
+    
+    def forward(self, x: HiddenStates) -> HiddenStates:
+        # 输入/输出: [batch, seq, hidden_dim]
+
+
+class MLP(nn.Module):
+    """LLaMA风格的MLP层 (SwiGLU变体)"""
+    
+    def __init__(self, hidden_dim: int, intermediate_dim: int):
+        # 结构: output = W_down(SiLU(W_gate(x)) * W_up(x))
+    
+    def forward(self, x: HiddenStates) -> HiddenStates:
+        # 输入/输出: [batch, seq, hidden_dim]
+
+
+3.2 rope.py: 旋转位置编码
+-------------------------
+
+class RotaryEmbedding(nn.Module):
+    """旋转位置编码模块"""
+    
+    def __init__(
+        self,
+        head_dim: int,
+        max_position_embeddings: int = 4096,
+        rope_theta: float = 10000.0,
+    ):
+        # 预计算逆频率表: 1 / (theta^(2i/d))
+    
+    def forward(
+        self,
+        q: Tensor,       # [batch, num_heads, seq_len, head_dim]
+        k: Tensor,       # [batch, num_kv_heads, seq_len, head_dim]
+        position_ids: Tensor,  # [batch, seq_len]
+    ) -> Tuple[Tensor, Tensor]:
+        # 返回旋转后的 (q, k)
+
+RoPE计算流程：
+1. 预计算频率表 inv_freq = 1/(theta^(2i/d))
+2. 根据position_ids获取对应的cos/sin值
+3. 对Q和K的每对相邻维度应用旋转变换
+
+
+3.3 attention.py: 多头自注意力（支持GQA）
+-----------------------------------------
+
+class SelfAttention(nn.Module):
+    """多头自注意力层，支持GQA"""
+    
+    def __init__(self, config: ModelConfig):
+        # Q投影: hidden_dim -> num_heads * head_dim
+        # K投影: hidden_dim -> num_kv_heads * head_dim
+        # V投影: hidden_dim -> num_kv_heads * head_dim
+        # O投影: num_heads * head_dim -> hidden_dim
+    
+    def forward(
+        self,
+        hidden_states: HiddenStates,        # [batch, seq, hidden_dim]
+        attention_mask: Optional[Tensor],   # [batch, 1, seq, seq]
+        position_ids: Optional[Tensor],     # [batch, seq]
+        kv_cache: Optional[KVCache] = None, # 预留接口
+    ) -> HiddenStates:
+        # 返回: [batch, seq, hidden_dim]
+
+内部步骤：
+1. 线性投影到 Q/K/V
+2. Reshape为多头格式 [B, N, S, D]
+3. 应用 RoPE 到 Q/K
+4. GQA: 扩展K/V以匹配Q的头数
+5. 计算 attention scores = Q @ K^T / sqrt(d)
+6. 应用 causal mask
+7. Softmax + weighted sum with V
+8. 输出投影
+
+
+3.4 transformer.py: DecoderLayer & DecoderOnlyModel
+---------------------------------------------------
+
+class DecoderLayer(nn.Module):
+    """单个Transformer解码层 (Pre-Norm, LLaMA风格)"""
+    
+    def __init__(self, config: ModelConfig, layer_idx: int = 0):
+        # self_attn: SelfAttention
+        # mlp: MLP
+        # input_layernorm: RMSNorm
+        # post_attention_layernorm: RMSNorm
+    
+    def forward(
+        self,
+        hidden_states: HiddenStates,
+        attention_mask: Optional[Tensor],
+        position_ids: Optional[Tensor],
+        kv_cache: Optional[KVCache] = None,
+    ) -> HiddenStates:
+        # 结构: x + attn(norm(x)) -> x + mlp(norm(x))
+
+
+class DecoderOnlyModel(nn.Module):
+    """Decoder-only Transformer模型"""
+    
+    def __init__(self, config: ModelConfig):
+        # embed_tokens: nn.Embedding
+        # layers: nn.ModuleList[DecoderLayer]
+        # norm: RMSNorm
+        # lm_head: nn.Linear
+    
+    def forward(
+        self,
+        input_ids: TokenIds,              # [batch, seq]
+        attention_mask: Optional[Tensor],
+        position_ids: Optional[Tensor],
+    ) -> Logits:                          # [batch, seq, vocab_size]
+
+
+def build_decoder_only_model(
+    model_config: ModelConfig,
+    engine_config: EngineConfig,
+) -> DecoderOnlyModel:
+    """工厂函数：构建模型并移动到指定设备/精度"""
+
+
+3.5 engine/generation.py: 最小生成接口
+--------------------------------------
+
+def generate(
+    model: DecoderOnlyModel,
+    input_ids: TokenIds,
+    model_config: ModelConfig,
+    engine_config: EngineConfig,
+    gen_config: Optional[GenerationConfig] = None,
+    eos_token_id: Optional[int] = None,
+    logger: Optional[logging.Logger] = None,
+) -> TokenIds:
+    """自回归文本生成（无KV Cache）"""
+
+内部逻辑：
+1. 初始化 input_ids 作为上下文
+2. for step in range(max_new_tokens):
+   a. 前向计算 logits = model(input_ids)
+   b. 取最后一个token的logits: logits[:, -1, :]
+   c. 根据 temperature/top_k/top_p 采样
+   d. 拼接新token到序列
+   e. 检查EOS，提前停止
+
+def sample_next_token(
+    logits: Logits,
+    temperature: float = 1.0,
+    top_k: int = 50,
+    top_p: float = 1.0,
+    do_sample: bool = True,
+) -> TokenIds:
+    """从logits采样下一个token"""
+
+def top_k_filtering(logits: Tensor, top_k: int) -> Tensor:
+    """Top-K过滤"""
+
+def top_p_filtering(logits: Tensor, top_p: float) -> Tensor:
+    """Top-P (Nucleus) 过滤"""
+
+
+第 4 部分：关键文件的代码实现
+--------------------------------------------------------------------------------
+
+所有代码已创建并验证：
+
+| 文件                                | 内容                                |
+|-------------------------------------|-------------------------------------|
+| my_llm_engine/models/layers.py      | RMSNorm + MLP(SwiGLU)               |
+| my_llm_engine/models/rope.py        | RotaryEmbedding + apply_rotary     |
+| my_llm_engine/models/attention.py   | SelfAttention (支持GQA)             |
+| my_llm_engine/models/transformer.py | DecoderLayer + DecoderOnlyModel     |
+| my_llm_engine/engine/generation.py  | generate() + 采样函数               |
+| examples/tiny_generate.py           | 完整验证脚本                        |
+| tests/test_tiny_model.py            | 12个单元测试                        |
+
+模型参数量示例（tiny_model.json配置）：
+- layers=4, hidden=256, heads=4
+- 总参数: 19,007,744 (19.01M)
+
+
+第 5 部分：阶段 1 验收清单 & 进入阶段 2 的建议
+--------------------------------------------------------------------------------
+
+阶段1自检清单（全部通过）：
+
+| 检查项           | 命令/验证方式                                         | 状态 |
+|------------------|-------------------------------------------------------|------|
+| 导入模型         | from my_llm_engine.models import DecoderOnlyModel     | ✓    |
+| 前向shape        | logits.shape == [B, S, vocab_size]                    | ✓    |
+| 生成测试         | python examples/tiny_generate.py                      | ✓    |
+| GQA验证          | num_heads=8, num_kv_heads=2 配置正常                  | ✓    |
+| 单元测试         | pytest tests/test_tiny_model.py (12 passed)           | ✓    |
+| 采样函数         | greedy/top-k/top-p 采样均正常                         | ✓    |
+
+
+进入阶段2（KV Cache + prefill/decode）的建议：
+
+1. 创建 engine/kv_cache.py
+   - 设计 KVCacheManager 类管理每层的K/V缓存
+   - 支持动态分配和释放缓存空间
+
+2. 修改 SelfAttention.forward
+   - 实现 KV Cache 的读取和更新路径
+   - decode阶段只计算新token的Q，复用缓存的K/V
+
+3. 拆分 prefill/decode
+   - DecoderOnlyModel 区分首次计算(prefill)和增量解码(decode)
+   - prefill: 处理完整prompt，填充KV Cache
+   - decode: 每次只处理1个新token
+
+4. 优化生成循环
+   - generate() 使用 KV Cache 避免重复计算
+   - 显著提升生成速度
+
+5. 添加位置偏移支持
+   - decode阶段正确处理 position_ids 累加
+   - 确保RoPE编码正确应用
+
+================================================================================

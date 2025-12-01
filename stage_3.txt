@@ -1,0 +1,173 @@
+================================================================================
+                    阶段 3：Engine + Scheduler + 多请求/批量
+================================================================================
+
+第 1 部分：阶段 3 目标总览
+--------------------------------------------------------------------------------
+
+核心增量：从「单请求 + KV Cache」升级为「多请求 + 调度器 + 批量执行」。
+
+实现内容：
+1. GenerationRequest：表示单个请求的完整生命周期（prompt、配置、KVCache、状态）
+2. Scheduler：管理waiting/running/finished队列，组装prefill/decode batch
+3. LLMEngine：统一协调模型和调度器，提供add_request()/step()/generate_batch()
+4. Continuous Batching：新请求可在已有请求decode过程中加入
+
+有意不做：
+- 不实现Paged KV/Block管理（留给阶段4）
+- 不做多机多卡分布式
+- 不做复杂优先级调度
+
+完成标准：47个测试全部通过，Engine与单请求generate结果完全一致
+
+
+第 2 部分：模块与文件结构
+--------------------------------------------------------------------------------
+
+新增文件：
+
+| 文件                          | 职责                                       |
+|-------------------------------|--------------------------------------------|
+| engine/request.py             | GenerationRequest类，请求生命周期管理      |
+| engine/scheduler.py           | Scheduler，waiting/running/finished队列    |
+| engine/engine.py              | LLMEngine，统一API                         |
+| examples/multi_generate.py    | 多请求示例                                 |
+| tests/test_engine_scheduler.py| 21个新测试                                 |
+
+目录结构：
+
+my_llm_engine/
+├── engine/
+│   ├── __init__.py        # 导出所有模块
+│   ├── kv_cache.py        # KVCache (阶段2)
+│   ├── request.py         # GenerationRequest
+│   ├── scheduler.py       # Scheduler
+│   ├── engine.py          # LLMEngine
+│   └── generation.py      # generate() 函数
+
+
+第 3 部分：核心接口设计
+--------------------------------------------------------------------------------
+
+3.1 GenerationRequest
+---------------------
+
+@dataclass
+class GenerationRequest:
+    request_id: str
+    prompt_ids: torch.Tensor      # [prompt_len] 1D
+    gen_config: GenerationConfig
+    eos_token_id: Optional[int] = None
+    
+    # 运行时状态
+    kv_cache: Optional[KVCache] = None
+    output_ids: List[int] = []    # 仅新生成的token
+    past_seq_len: int = 0         # KVCache中已缓存长度
+    status: RequestStatus         # WAITING/RUNNING/FINISHED/ERROR
+    
+    # 方法
+    @classmethod
+    def create(cls, prompt_ids, gen_config, ...) -> GenerationRequest
+    def add_token(self, token_id: int) -> None
+    def get_last_token_id(self) -> int
+    def get_full_sequence(self) -> torch.Tensor
+    def can_continue(self) -> bool
+
+
+3.2 Scheduler
+-------------
+
+class Scheduler:
+    def __init__(self, max_batch_size: int, max_seq_len: int)
+    
+    def add_request(self, request: GenerationRequest) -> None
+    def has_unfinished_requests(self) -> bool
+    def schedule_prefill_batch(self) -> List[GenerationRequest]
+    def schedule_decode_batch(self) -> List[GenerationRequest]
+    def mark_prefill_done(self, requests: List[GenerationRequest]) -> None
+    def mark_finished(self, request: GenerationRequest) -> None
+    def update_finished(self) -> List[GenerationRequest]
+
+
+3.3 LLMEngine
+-------------
+
+class LLMEngine:
+    def __init__(
+        self,
+        model: DecoderOnlyModel,
+        model_config: ModelConfig,
+        engine_config: EngineConfig,
+        scheduler: Optional[Scheduler] = None,
+    )
+    
+    def add_request(
+        self,
+        prompt_ids: TokenIds,
+        gen_config: Optional[GenerationConfig] = None,
+        eos_token_id: Optional[int] = None,
+    ) -> str  # 返回request_id
+    
+    def step(self) -> Dict[str, int]
+        """执行一步：prefill待处理请求 + decode运行中请求"""
+    
+    def run_until_complete(self, max_steps: Optional[int] = None) -> None
+    
+    def get_response(self, request_id: str) -> Optional[GenerationRequest]
+    
+    def generate_batch(
+        self,
+        batch_prompts: Sequence[TokenIds],
+        gen_config: Optional[GenerationConfig] = None,
+    ) -> List[torch.Tensor]
+
+
+第 4 部分：实现要点
+--------------------------------------------------------------------------------
+
+1. 请求状态机:
+   WAITING -> (prefill) -> RUNNING -> (decode循环) -> FINISHED
+                                   -> ERROR (超长/异常)
+
+2. past_seq_len管理:
+   - prefill后: past_seq_len = prompt_len
+   - decode后: past_seq_len += 1
+   - 与generation.py保持一致，确保数值正确
+
+3. 批量执行（简化版）:
+   - 当前逐个请求执行prefill/decode
+   - 未来可优化为真正的batch处理
+
+4. 动态请求添加:
+   - 新请求可在已有请求decode过程中加入waiting队列
+   - 下一个step会为其安排prefill
+
+
+第 5 部分：验收清单
+--------------------------------------------------------------------------------
+
+阶段3自检清单（全部通过）:
+
+| 检查项                                    | 状态 |
+|-------------------------------------------|------|
+| GenerationRequest创建、添加token、状态转换 | ✓    |
+| Scheduler队列管理、batch调度               | ✓    |
+| LLMEngine单请求生成                        | ✓    |
+| LLMEngine多请求生成                        | ✓    |
+| generate_batch API                         | ✓    |
+| 动态添加请求（Continuous Batching）        | ✓    |
+| Engine vs 单请求generate一致性             | ✓    |
+| batch vs 逐个生成一致性                    | ✓    |
+| EOS处理                                    | ✓    |
+| 47个测试全部通过                           | ✓    |
+
+
+进入阶段4（Paged KV + 性能优化）的建议：
+
+1. 创建BlockManager管理全局KV block池
+2. 实现PagedKVCache替代DenseKVCache
+3. 修改SelfAttention支持两种KV实现
+4. 添加轻量级Profiler统计性能
+5. 添加test_paged_kv.py验证数值一致性
+
+================================================================================

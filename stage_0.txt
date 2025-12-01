@@ -1,0 +1,191 @@
+================================================================================
+                    阶段 0：项目骨架 & 基础配置系统
+================================================================================
+
+第 1 部分：阶段 0 目标总览
+--------------------------------------------------------------------------------
+
+核心问题：建立可扩展的项目基础设施，包括配置管理、日志系统和类型约定，
+为后续模型加载和推理逻辑提供统一的基础架构。
+
+后续阶段依赖：
+- 阶段1（MVP前向推理）：依赖 ModelConfig 定义模型结构，EngineConfig 控制设备/精度，
+  tensor_types 提供类型注释
+- 阶段2（KV Cache）：依赖 KVCache/KVPair 类型定义，EngineConfig.use_kv_cache 开关
+- 阶段3（调度和批量）：依赖 EngineConfig.max_batch_size，日志系统追踪调度状态
+- 阶段4（性能优化）：依赖 EngineConfig.dtype（量化），max_memory_gb 内存限制
+
+完成标准：
+1. 可执行 pip install -e . 安装项目
+2. 可运行 python examples/basic_generate.py 看到正常日志
+3. 可从包导入：from my_llm_engine import ModelConfig, EngineConfig, get_logger
+
+
+第 2 部分：项目目录 & 文件结构
+--------------------------------------------------------------------------------
+
+model_inference/
+├── my_llm_engine/                  # 主包
+│   ├── __init__.py                 # 包入口，导出公共API
+│   ├── config.py                   # 配置类：ModelConfig, EngineConfig, GenerationConfig
+│   ├── logging_utils.py            # 日志工具：get_logger, setup_logging
+│   ├── tensor_types.py             # 类型别名：Tensor, HiddenStates, KVCache等
+│   ├── models/                     # 模型定义（后续阶段）
+│   │   └── __init__.py
+│   └── engine/                     # 推理引擎（后续阶段）
+│       └── __init__.py
+├── examples/
+│   └── basic_generate.py           # 阶段0烟雾测试脚本
+├── configs/
+│   ├── default_engine.json         # 默认引擎配置示例
+│   └── tiny_model.json             # 小模型配置示例
+├── pyproject.toml                  # 项目元数据和依赖
+└── venv/                           # Python虚拟环境
+
+阶段0实现的文件职责：
+
+| 文件               | 职责                                                       |
+|--------------------|------------------------------------------------------------|
+| config.py          | 定义三个dataclass配置类，支持从dict/JSON加载、环境变量覆盖  |
+| logging_utils.py   | 封装Python logging，提供统一格式和级别控制                  |
+| tensor_types.py    | 定义语义化张量类型别名，提升代码可读性                      |
+| __init__.py        | 统一导出公共API，定义__all__                                |
+| basic_generate.py  | 验证所有基础模块可用的测试脚本                              |
+
+
+第 3 部分：关键模块的接口设计
+--------------------------------------------------------------------------------
+
+3.1 config.py
+-------------
+
+@dataclass
+class ModelConfig:
+    """模型结构配置"""
+    vocab_size: int = 32000
+    hidden_dim: int = 4096
+    num_layers: int = 32
+    num_heads: int = 32
+    num_kv_heads: Optional[int] = None  # GQA支持
+    intermediate_dim: int = 11008
+    max_position_embeddings: int = 4096
+    rope_theta: float = 10000.0
+    rms_norm_eps: float = 1e-5
+    
+    @classmethod
+    def from_dict(cls, config_dict: Dict) -> ModelConfig
+    @classmethod
+    def from_json(cls, json_path: Path) -> ModelConfig
+    def to_dict(self) -> Dict
+    def save_json(self, json_path: Path) -> None
+
+@dataclass
+class EngineConfig:
+    """推理引擎配置"""
+    device: str = "cuda"
+    dtype: str = "float16"
+    max_seq_len: int = 2048
+    max_batch_size: int = 8
+    max_memory_gb: Optional[float] = None
+    use_kv_cache: bool = True
+    log_level: str = "INFO"
+    
+    @property
+    def torch_dtype(self) -> torch.dtype
+    @property
+    def torch_device(self) -> torch.device
+    @classmethod
+    def from_env(cls, prefix: str) -> EngineConfig
+    def merge(self, overrides: Dict) -> EngineConfig
+
+@dataclass
+class GenerationConfig:
+    """文本生成参数"""
+    max_new_tokens: int = 256
+    temperature: float = 1.0
+    top_p: float = 1.0
+    top_k: int = 50
+    do_sample: bool = True
+
+
+3.2 logging_utils.py
+--------------------
+
+def setup_logging(
+    level: Union[str, int] = logging.INFO,
+    log_file: Optional[Path] = None,
+    format_str: str = DEFAULT_FORMAT
+) -> None
+    """全局日志初始化"""
+
+def get_logger(name: str) -> logging.Logger
+    """获取命名logger"""
+
+def set_log_level(level: Union[str, int]) -> None
+    """动态修改日志级别"""
+
+class LoggerMixin:
+    """为类提供self.logger属性"""
+
+
+3.3 tensor_types.py
+-------------------
+
+Tensor = torch.Tensor                          # 基础别名
+TokenIds = torch.Tensor                        # [B, S]
+HiddenStates = torch.Tensor                    # [B, S, H]
+AttentionTensor = torch.Tensor                 # [B, N, S, D]
+Logits = torch.Tensor                          # [B, S, V]
+KVPair = Tuple[torch.Tensor, torch.Tensor]     # (K, V)
+KVCache = List[KVPair]                         # 所有层的KV
+
+def check_tensor_shape(tensor, expected_dims, name) -> None
+def check_tensor_dtype(tensor, expected_dtype, name) -> None
+
+
+第 4 部分：完整代码骨架
+--------------------------------------------------------------------------------
+
+所有代码已创建在以下位置：
+
+- my_llm_engine/config.py          - 配置系统
+- my_llm_engine/logging_utils.py   - 日志工具
+- my_llm_engine/tensor_types.py    - 类型别名
+- my_llm_engine/__init__.py        - 包导出
+- examples/basic_generate.py       - 验证脚本
+- pyproject.toml                   - 项目配置
+
+
+第 5 部分：验收检查清单 & 下一步建议
+--------------------------------------------------------------------------------
+
+阶段0自检清单：
+
+| 检查项           | 验证命令                                              | 状态 |
+|------------------|-------------------------------------------------------|------|
+| 虚拟环境可用     | source venv/bin/activate                              | ✓    |
+| 项目可安装       | pip install -e .                                      | ✓    |
+| 示例可运行       | python examples/basic_generate.py                     | ✓    |
+| 导入配置类       | from my_llm_engine import ModelConfig, EngineConfig   | ✓    |
+| 日志工作正常     | 示例输出带时间戳的日志                                | ✓    |
+| JSON配置加载     | ModelConfig.from_json("configs/tiny_model.json")      | ✓    |
+
+
+进入阶段1（MVP前向推理）的下一步建议：
+
+1. 实现RMSNorm层 (my_llm_engine/models/layers.py)
+   - LLaMA风格的归一化层，是所有Transformer块的基础组件
+
+2. 实现RoPE位置编码 (my_llm_engine/models/rope.py)
+   - 旋转位置编码，现代LLM的标准位置编码方案
+
+3. 实现Attention模块 (my_llm_engine/models/attention.py)
+   - 支持GQA(Grouped Query Attention)的注意力机制
+
+4. 实现DecoderLayer (my_llm_engine/models/transformer.py)
+   - 单个Transformer解码层，组合Attention和FFN
+
+5. 创建TinyModel测试 (tests/test_tiny_model.py)
+   - 用tiny_model.json配置创建小模型，验证前向传播正确性
+
+================================================================================

@@ -1,0 +1,216 @@
+================================================================================
+                    阶段 4：Paged KV Cache + 性能分析
+================================================================================
+
+第 1 部分：阶段 4 目标总览
+--------------------------------------------------------------------------------
+
+核心增量：从「Dense KVCache」升级为「Paged KV + Block管理」，为大规模并发
+和长序列做准备。
+
+实现内容：
+1. BlockManager：全局KV block池管理，预分配固定数量block
+2. PagedKVCache：基于block的分页KV缓存，支持动态分配和释放
+3. SimpleProfiler：轻量级性能分析工具，统计各阶段耗时
+4. Dense与Paged KV的数值一致性验证
+
+有意不做：
+- 不做多机多卡分布式
+- 不做编译型后端（TensorRT/TVM）
+- 不做权重量化（留给阶段5）
+
+预留扩展点：
+- Block层可引入量化（4bit/8bit压缩）
+- BlockManager可扩展为跨设备管理
+- Profiler结果可指导后续优化方向
+
+
+第 2 部分：模块与文件结构
+--------------------------------------------------------------------------------
+
+新增文件：
+
+| 文件                          | 职责                                       |
+|-------------------------------|--------------------------------------------|
+| engine/block_manager.py       | BlockManager，全局block池管理              |
+| engine/paged_kv_cache.py      | PagedKVCache，分页式KV缓存                 |
+| engine/profiler.py            | SimpleProfiler，轻量级性能分析             |
+| tests/test_paged_kv.py        | 17个测试（BlockManager/PagedKV/Profiler）  |
+
+目录结构：
+
+my_llm_engine/
+├── engine/
+│   ├── __init__.py            # 导出所有模块
+│   ├── kv_cache.py            # DenseKVCache (原实现)
+│   ├── block_manager.py       # BlockManager
+│   ├── paged_kv_cache.py      # PagedKVCache
+│   ├── profiler.py            # SimpleProfiler
+│   ├── request.py             # GenerationRequest
+│   ├── scheduler.py           # Scheduler
+│   ├── engine.py              # LLMEngine
+│   └── generation.py          # generate()
+
+
+第 3 部分：核心接口设计
+--------------------------------------------------------------------------------
+
+3.1 BlockManager
+----------------
+
+class BlockManager:
+    """全局KV Block池管理器"""
+    
+    # 存储形状: [num_layers, num_blocks, num_kv_heads, block_size, head_dim]
+    k_storage: Tensor
+    v_storage: Tensor
+    
+    def __init__(
+        self,
+        num_layers: int,
+        num_kv_heads: int,
+        head_dim: int,
+        block_size: int = 16,
+        num_blocks: int = 256,
+        device: torch.device,
+        dtype: torch.dtype,
+    )
+    
+    @classmethod
+    def from_config(cls, model_config, engine_config, block_size, num_blocks) -> BlockManager
+    
+    def allocate_blocks(self, num_blocks_needed: int, seq_id: int = -1) -> List[int]
+    def free_blocks(self, block_ids: List[int]) -> None
+    def write_kv(self, layer_idx, block_id, offset, key, value) -> None
+    def read_kv(self, layer_idx, block_ids, seq_len) -> Tuple[Tensor, Tensor]
+    def num_free_blocks(self) -> int
+    def max_tokens_supported(self) -> int
+    def get_memory_usage(self) -> int
+
+
+3.2 PagedKVCache
+----------------
+
+@dataclass
+class SequenceKVState:
+    """单个序列的KV状态"""
+    seq_id: int
+    num_layers: int
+    block_size: int
+    block_tables: List[List[int]]  # 每层使用的block列表
+    seq_len: int = 0
+
+class PagedKVCache:
+    """分页式KV缓存"""
+    
+    def __init__(self, block_manager: BlockManager, max_blocks_per_seq: int = 64)
+    
+    def create_sequence(self, seq_id: Optional[int] = None) -> int
+    def delete_sequence(self, seq_id: int) -> None
+    def append_kv(self, seq_id, layer_idx, key, value) -> None
+    def get_kv(self, seq_id, layer_idx) -> KVPair
+    def get_seq_len(self, seq_id) -> int
+    def update(self, seq_id, layer_idx, key, value, start_pos) -> KVPair
+
+class PagedKVCacheWrapper:
+    """单序列包装器，提供与DenseKVCache兼容的接口"""
+    
+    def __init__(self, paged_cache: PagedKVCache, seq_id: int)
+    def get_layer_kv(self, layer_idx, seq_len) -> KVPair
+    def update(self, layer_idx, key, value, start_pos) -> KVPair
+
+
+3.3 SimpleProfiler
+------------------
+
+@dataclass
+class TimingStats:
+    name: str
+    total_time: float
+    count: int
+    min_time: float
+    max_time: float
+
+class SimpleProfiler:
+    def __init__(self, enabled: bool = True)
+    
+    @contextmanager
+    def record(self, name: str):
+        """用法: with profiler.record("prefill"): ..."""
+    
+    def increment(self, name: str, value: int = 1) -> None
+    def summary(self) -> Dict[str, dict]
+    def print_summary(self) -> None
+    def reset(self) -> None
+
+
+第 4 部分：实现要点
+--------------------------------------------------------------------------------
+
+1. Block分配策略:
+   - 固定block_size（如16 tokens）
+   - 预分配num_blocks个block
+   - 分配不足时抛出RuntimeError
+
+2. 跨block写入:
+   - 当seq_len % block_size == 0时需要新block
+   - 所有层共享同一组block_id（简化实现）
+
+3. Dense vs Paged一致性:
+   - 写入相同数据后，读取结果完全一致
+   - 增量追加也保持一致
+
+4. 内存效率:
+   - Paged模式按需分配，避免预分配max_seq_len
+   - 序列删除时立即释放block
+
+
+第 5 部分：验收清单
+--------------------------------------------------------------------------------
+
+阶段4自检清单（全部通过）:
+
+| 检查项                                    | 状态 |
+|-------------------------------------------|------|
+| BlockManager创建、分配、释放、重置         | ✓    |
+| BlockManager写入和读取KV                   | ✓    |
+| PagedKVCache创建序列、追加KV、删除序列     | ✓    |
+| PagedKVCache跨block追加                    | ✓    |
+| PagedKVCacheWrapper兼容接口                | ✓    |
+| Dense vs Paged KV内容一致                  | ✓    |
+| Dense vs Paged增量追加一致                 | ✓    |
+| Profiler计时、计数器、重置                 | ✓    |
+| 64个测试全部通过                           | ✓    |
+
+
+测试统计:
+- test_tiny_model.py: 12个测试
+- test_kv_cache.py: 14个测试  
+- test_engine_scheduler.py: 21个测试
+- test_paged_kv.py: 17个测试
+- 总计: 64个测试全部通过
+
+
+进入阶段5（量化/多GPU/编译后端）的建议：
+
+1. Block级量化
+   - 对K/V做INT8/INT4量化，减少内存占用
+   - 在BlockManager层实现，对上层透明
+
+2. 多GPU支持
+   - 将不同层分配到不同设备（Pipeline Parallel）
+   - BlockManager支持跨设备block池
+
+3. 编译优化
+   - 导出ONNX/TorchScript
+   - 接入TensorRT/TVM后端
+
+4. Attention优化
+   - 实现FlashAttention接口
+   - 减少内存访问开销
+
+5. 使用Profiler定位瓶颈
+   - 分析prefill/decode各阶段耗时
+   - 针对热点进行优化
+
+================================================================================

@@ -1,0 +1,298 @@
+================================================================================
+                    阶段 2：KV Cache + Prefill/Decode
+================================================================================
+
+第 1 部分：阶段 2 目标总览
+--------------------------------------------------------------------------------
+
+阶段2将当前"每步重算整个序列"的推理改造为真正的增量推理模式：
+
+1. Prefill阶段：对完整prompt做一次前向计算，生成并缓存所有层的K/V张量
+2. Decode阶段：每步只对新token做前向，从KVCache读取历史K/V，计算注意力后更新缓存
+3. KVCache抽象：设计统一的KVCache类管理所有层的K/V缓存，支持GQA
+4. 数值一致性：确保有无KVCache时，对同一prompt产生完全相同的logits
+5. 完成标准：KV版本生成结果与无KV版本一致，所有26个测试通过
+
+
+第 2 部分：模块与文件结构设计
+--------------------------------------------------------------------------------
+
+目录结构（阶段2相关部分）:
+
+my_llm_engine/
+├── models/
+│   ├── attention.py      # 修改：接入KVCache逻辑，支持prefill/decode模式
+│   └── transformer.py    # 修改：添加prefill()/decode()方法
+├── engine/
+│   ├── __init__.py       # 修改：导出KVCache
+│   ├── kv_cache.py       # 新增：KVCache类
+│   └── generation.py     # 修改：使用KVCache的generate()
+examples/
+└── tiny_generate.py      # 修改：添加KV Cache对比示例
+tests/
+└── test_kv_cache.py      # 新增：14个KV一致性测试
+
+文件职责:
+
+| 文件            | 职责                                                    |
+|-----------------|---------------------------------------------------------|
+| kv_cache.py     | KVCache类，管理所有层的K/V缓存，支持增量更新            |
+| attention.py    | SelfAttention支持KVCache读写，自动构造causal mask       |
+| transformer.py  | DecoderOnlyModel提供prefill()/decode()两阶段API         |
+| generation.py   | generate()支持use_kv_cache开关，benchmark_generation()  |
+| test_kv_cache.py| 数值一致性、生成结果匹配、GQA支持等14个测试             |
+
+
+第 3 部分：核心接口设计（详细Spec）
+--------------------------------------------------------------------------------
+
+3.1 engine/kv_cache.py：KVCache类
+---------------------------------
+
+class KVCache:
+    """KV缓存管理器"""
+    
+    # 存储形状:
+    # k_cache[layer]: [batch, num_kv_heads, max_seq_len, head_dim]
+    # v_cache[layer]: [batch, num_kv_heads, max_seq_len, head_dim]
+    
+    def __init__(
+        self,
+        num_layers: int,
+        batch_size: int,
+        max_seq_len: int,
+        num_kv_heads: int,
+        head_dim: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ): ...
+    
+    @classmethod
+    def empty(
+        cls,
+        model_config: ModelConfig,
+        engine_config: EngineConfig,
+        batch_size: int,
+    ) -> "KVCache":
+        """工厂方法：创建空的KVCache"""
+    
+    @property
+    def seq_len(self) -> int:
+        """当前已缓存的序列长度"""
+    
+    def get_layer_kv(
+        self, 
+        layer_idx: int, 
+        seq_len: Optional[int] = None
+    ) -> KVPair:
+        """获取指定层的KV缓存 [batch, num_kv_heads, seq_len, head_dim]"""
+    
+    def update(
+        self,
+        layer_idx: int,
+        key: Tensor,       # [batch, num_kv_heads, new_seq_len, head_dim]
+        value: Tensor,     # [batch, num_kv_heads, new_seq_len, head_dim]
+        start_pos: int,
+    ) -> KVPair:
+        """更新缓存并返回完整KV（历史+新增）"""
+    
+    def reset(self) -> None:
+        """重置缓存"""
+    
+    def get_memory_usage(self) -> int:
+        """获取内存占用（字节）"""
+
+
+3.2 models/attention.py：SelfAttention
+--------------------------------------
+
+class SelfAttention(nn.Module):
+    def forward(
+        self,
+        hidden_states: HiddenStates,   # [B, S, H], S在decode时为1
+        attention_mask: Optional[Tensor] = None,
+        position_ids: Optional[Tensor] = None,
+        kv_cache: Optional[KVCache] = None,
+        layer_idx: int = 0,
+        past_seq_len: int = 0,         # 已缓存长度，0=prefill模式
+    ) -> HiddenStates:
+        """
+        前向传播，支持两种模式:
+        
+        Prefill模式 (past_seq_len=0):
+        - 对整段hidden_states计算Q/K/V
+        - 对Q/K应用RoPE（position从0开始）
+        - 把K/V写入KVCache[0:seq_len]
+        - 计算标准causal attention
+        
+        Decode模式 (past_seq_len>0):
+        - 只对新token计算Q/K/V
+        - 对Q/K应用RoPE（position从past_seq_len开始）
+        - 把新K/V追加到KVCache[past_seq_len:past_seq_len+1]
+        - Q与完整历史K/V计算attention
+        """
+
+内部步骤:
+1. 线性投影 -> Q/K/V
+2. Reshape为多头格式 [B, num_heads, S, head_dim]
+3. 生成position_ids（从past_seq_len开始）
+4. 应用RoPE到Q/K
+5. 若kv_cache非None，调用kv_cache.update()获取完整K/V
+6. GQA扩展K/V头数
+7. 计算attention: Q @ K^T / sqrt(d)
+8. 应用causal mask（decode模式自动构造）
+9. Softmax + 加权求和
+10. 输出投影
+
+
+3.3 models/transformer.py：DecoderOnlyModel
+-------------------------------------------
+
+class DecoderOnlyModel(nn.Module):
+    
+    def forward(
+        self,
+        input_ids: TokenIds,           # [B, S]
+        attention_mask: Optional[Tensor] = None,
+        position_ids: Optional[Tensor] = None,
+    ) -> Logits:
+        """兼容模式（不使用KV Cache）"""
+    
+    def prefill(
+        self,
+        input_ids: TokenIds,           # [B, prompt_len]
+        kv_cache: KVCache,             # 将被填充
+        attention_mask: Optional[Tensor] = None,
+        position_ids: Optional[Tensor] = None,
+    ) -> Logits:
+        """
+        Prefill阶段：处理完整prompt
+        - position_ids从0开始
+        - 填充kv_cache[0:prompt_len]
+        - 返回logits [B, prompt_len, V]
+        """
+    
+    def decode(
+        self,
+        input_ids: TokenIds,           # [B, 1] 新token
+        kv_cache: KVCache,             # 包含历史KV
+        past_seq_len: int,             # 已缓存长度
+        attention_mask: Optional[Tensor] = None,
+        position_ids: Optional[Tensor] = None,
+    ) -> Logits:
+        """
+        Decode阶段：增量解码
+        - position_ids从past_seq_len开始
+        - 更新kv_cache[past_seq_len:past_seq_len+1]
+        - 返回logits [B, 1, V]
+        """
+
+
+3.4 engine/generation.py：generate()
+------------------------------------
+
+def generate(
+    model: DecoderOnlyModel,
+    input_ids: TokenIds,               # [B, prompt_len]
+    model_config: ModelConfig,
+    engine_config: EngineConfig,
+    gen_config: GenerationConfig,
+    eos_token_id: Optional[int] = None,
+    use_kv_cache: bool = True,         # 新增开关
+    logger: Optional[Logger] = None,
+) -> TokenIds:
+    """
+    自回归文本生成
+    
+    use_kv_cache=True时的流程:
+    1. 创建空KVCache
+    2. prefill: logits = model.prefill(input_ids, kv_cache)
+    3. 采样第一个新token
+    4. decode循环:
+       - logits = model.decode(new_token, kv_cache, past_seq_len)
+       - 采样下一个token
+       - past_seq_len += 1
+    5. 返回完整序列
+    """
+
+def benchmark_generation(...) -> dict:
+    """对比有无KV Cache的性能"""
+
+
+第 4 部分：实现建议与注意事项
+--------------------------------------------------------------------------------
+
+1. GQA与KV形状的关系:
+   - Q投影: hidden_dim -> num_heads * head_dim
+   - K/V投影: hidden_dim -> num_kv_heads * head_dim
+   - KVCache存储形状: [B, num_kv_heads, S, head_dim]
+   - attention时通过_repeat_kv()扩展K/V头数
+
+2. RoPE与增量模式:
+   - RoPE只依赖position_ids，与绝对位置相关
+   - prefill: position_ids = [0, 1, ..., prompt_len-1]
+   - decode: position_ids = [past_seq_len]
+   - 必须保证位置连续性
+
+3. Causal Mask处理:
+   - prefill: 标准下三角mask [S, S]
+   - decode: 新token可以看到所有历史，无需mask（或全0 mask）
+   - attention.py中_make_causal_mask()自动处理
+
+4. 与阶段1的兼容:
+   - 保留forward()方法，内部调用时kv_cache=None
+   - generate()默认use_kv_cache=True，可切换回无cache模式
+   - 原有12个单元测试全部通过
+
+
+第 5 部分：阶段 2 验收清单 & 下一步建议
+--------------------------------------------------------------------------------
+
+阶段2自检清单（全部通过）:
+
+| 检查项                           | 状态 |
+|----------------------------------|------|
+| KVCache创建、更新、获取正常      | ✓    |
+| prefill后logits与forward一致     | ✓    |
+| decode后logits与完整forward一致  | ✓    |
+| 多步decode累积一致性             | ✓    |
+| GQA配置正常工作                  | ✓    |
+| generate(use_kv_cache=True)正常  | ✓    |
+| generate(use_kv_cache=False)正常 | ✓    |
+| Greedy生成结果完全匹配           | ✓    |
+| 批量生成正常                     | ✓    |
+| 26个单元测试全部通过             | ✓    |
+
+数值一致性验证:
+- Logits最大差异: 9.54e-07（接近浮点精度极限）
+- Greedy生成结果完全一致
+
+性能说明:
+- 在CPU + 小模型 + 短序列场景下，KV Cache可能无加速甚至略慢
+- 这是因为索引操作的额外开销超过了节省的计算量
+- 在真实场景（GPU + 大模型 + 长序列）下会有显著加速
+
+
+进入阶段3（Engine + Scheduler，多请求 & 批量）的下一步建议:
+
+1. 设计GenerationRequest结构
+   - 为每个请求绑定KVCache、状态（pending/running/finished）
+   - 支持不同prompt长度和生成配置
+   
+2. 创建Scheduler模块 (engine/scheduler.py)
+   - 根据max_batch_size将多个请求组成batch
+   - 处理请求的到达、完成、超时
+   
+3. 创建Engine类 (engine/engine.py)
+   - 统一管理模型、调度器、KVCache池
+   - 提供Engine.step()方法处理一步推理
+   
+4. 支持Continuous Batching
+   - 不同请求的past_seq_len可能不同
+   - 需要padding或分组处理
+   
+5. 内存管理优化
+   - KVCache池化复用
+   - 按需分配而非预分配全部max_seq_len
+
+================================================================================
